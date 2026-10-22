@@ -143,7 +143,7 @@ sensor.fnos_all_entities            # 聚合实体
 
 ---
 
-## 四、与「房间精灵」搭配使用（推荐）
+## 四、与「房间精灵」搭配使用（推荐）https://github.com/chjspp520/room-elves-card
 
 <img width="414" height="795" alt="1" src="https://github.com/user-attachments/assets/c689786d-a4f6-4888-9825-a396f427797b" /><img width="1171" height="710" alt="4" src="https://github.com/user-attachments/assets/1db18934-d56b-415b-ad14-6d6b9c9aba59" />
 <img width="412" height="788" alt="3" src="https://github.com/user-attachments/assets/7ea7c795-916f-4507-afe6-c4bbc5b1d185" />
