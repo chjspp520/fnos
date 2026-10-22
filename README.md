@@ -3,7 +3,7 @@
 把飞牛 fnOS NAS 接入 Home Assistant 的自定义集成：系统状态、硬盘健康、Docker 容器、虚拟机（**含远程控制**）、文件/相册/影视应用、服务开关、电源操作，全部实体化；并额外提供**同源反向代理 + 前端悬浮窗**，让 NAS 的 Web 界面和虚拟机控制台能直接在 HA 里打开。
 
 - 仓库：<https://github.com/chjspp520/fnos>
-- 开发者：**chjspp520** 与 **撸大师** 共同开发
+- 开发者：**chjspp520** 与 **撸大师** 共同开发（主要是**撸大师**完成集成的开发）
 - 维护者：[@chjspp520](https://github.com/chjspp520)
 - 版本：**1.0.0**
 - 依赖：`websocket-client>=1.6.0`、`pycryptodome>=3.19.0`（HA 会自动安装）
