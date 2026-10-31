@@ -333,7 +333,13 @@ class FnOsClient:
             while True:
                 got = self._pending.get(rid)
                 if got:
-                    return got.pop(0)
+                    value = got.pop(0)
+                    # 请求已完成：把这次请求的槽位删掉。
+                    # 原来只 pop 消息、键永远留着，_pending 以「每 30 秒约 35 个键」
+                    # 的速度只增不减，只有 WebSocket 重连才会整体清空。
+                    if not got:
+                        self._pending.pop(rid, None)
+                    return value
                 remain = deadline - time.monotonic()
                 if remain <= 0:
                     self._pending.pop(rid, None)

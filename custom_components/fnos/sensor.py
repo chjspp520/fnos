@@ -78,6 +78,28 @@ def _num(value, digits=1):
     return round(value, digits)
 
 
+#: 网速实体统一单位（固定单位，避免自动换算导致 HA 报「单位已改变」）
+SPEED_UNIT = "KB/s"
+#: 磁盘读写速率统一单位（同上）
+DISK_SPEED_UNIT = "MB/s"
+
+
+def _kb_s(value):
+    """B/s → KB/s（固定单位，缺值返回 None 而不是 0）。"""
+    value = _num(value)
+    if value is None:
+        return None
+    return round(value / 1024.0, 1)
+
+
+def _mb_s(value):
+    """B/s → MB/s（固定单位，缺值返回 None 而不是 0）。"""
+    value = _num(value)
+    if value is None:
+        return None
+    return round(value / 1048576.0, 2)
+
+
 def _human_bytes(value):
     """防御式容量展示：按最大单位换算（fnOS 未公开字段单位）。"""
     value = _num(value)
@@ -1404,20 +1426,24 @@ def _host_sensors(coordinator, entry):
             attrs_fn=lambda s: {"gpu": resmon(s).get("gpu_name")}),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "net_down", "网络下载速率",
-            state_class=SensorStateClass.MEASUREMENT, icon="mdi:download-network",
-            value_fn=lambda s: _human_speed(resmon(s).get("net_down"))),
+            unit=SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:download-network",
+            value_fn=lambda s: _kb_s(resmon(s).get("net_down"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "net_up", "网络上传速率",
-            state_class=SensorStateClass.MEASUREMENT, icon="mdi:upload-network",
-            value_fn=lambda s: _human_speed(resmon(s).get("net_up"))),
+            unit=SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:upload-network",
+            value_fn=lambda s: _kb_s(resmon(s).get("net_up"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "disk_read", "磁盘读取速率",
-            state_class=SensorStateClass.MEASUREMENT, icon="mdi:read",
-            value_fn=lambda s: _human_speed(resmon(s).get("disk_read"))),
+            unit=DISK_SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:read",
+            value_fn=lambda s: _mb_s(resmon(s).get("disk_read"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "disk_write", "磁盘写入速率",
-            state_class=SensorStateClass.MEASUREMENT, icon="mdi:pencil",
-            value_fn=lambda s: _human_speed(resmon(s).get("disk_write"))),
+            unit=DISK_SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:pencil",
+            value_fn=lambda s: _mb_s(resmon(s).get("disk_write"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "fan", "风扇转速",
             state_class=SensorStateClass.MEASUREMENT, icon="mdi:fan",
@@ -1572,15 +1598,15 @@ def _host_sensors(coordinator, entry):
             }),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "dl_down", "下载中心下行速度",
-            state_class=SensorStateClass.MEASUREMENT,
+            unit=SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
             icon="mdi:download-network",
-            value_fn=lambda s: (_human_speed(download(s).get("speed_down"))
+            value_fn=lambda s: (_kb_s(download(s).get("speed_down"))
                                 if download(s).get("installed") else None)),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "dl_up", "下载中心上行速度",
-            state_class=SensorStateClass.MEASUREMENT,
+            unit=SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
             icon="mdi:upload-network",
-            value_fn=lambda s: (_human_speed(download(s).get("speed_up"))
+            value_fn=lambda s: (_kb_s(download(s).get("speed_up"))
                                 if download(s).get("installed") else None)),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "containers_running", "运行中容器",
@@ -1621,14 +1647,6 @@ def _uptime_dt(seconds):
     if not 0 < seconds < 10 ** 10:
         return None
     return datetime.now(timezone.utc) - timedelta(seconds=seconds)
-
-
-def _human_speed(value):
-    """速率展示：_human_bytes 结果追加 /s 单位。"""
-    result = _human_bytes(value)
-    if isinstance(result, tuple) and len(result) == 2:
-        return result[0], result[1] + "/s"
-    return None
 
 
 def _human_mb(value):
@@ -1709,9 +1727,9 @@ def _docker_sensors(coordinator, entry, only_name=None, known=None):
                 value_fn=lambda s, f=get_row: _human_mb(f(s).get("mem_mb"))),
             FnOsSnapshotSensor(
                 coordinator, entry, kind, name, "net", "网络收发",
-                state_class=SensorStateClass.MEASUREMENT,
+                unit=SPEED_UNIT, state_class=SensorStateClass.MEASUREMENT,
                 icon="mdi:transfer",
-                value_fn=lambda s, f=get_row: _human_speed(
+                value_fn=lambda s, f=get_row: _kb_s(
                     f(s).get("net_rx")),
                 attrs_fn=lambda s, f=get_row: {
                     "rx": f(s).get("net_rx"),
