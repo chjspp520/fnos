@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from datetime import timedelta
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.const import STATE_OFF
@@ -12,10 +13,17 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_call_later
+from homeassistant.helpers.event import (
+    async_call_later,
+    async_track_time_interval,
+)
 from homeassistant.helpers.restore_state import RestoreEntity
 
-from . import FnOsEntity
+from . import (
+    FnOsEntity,
+    live_dynamic_keys,
+    purge_dynamic_entities,
+)
 from .api import FnOsApiError
 from .const import (
     DOMAIN,
@@ -52,45 +60,68 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         entities.append(FnOsServiceSwitch(coordinator, entry, key, label))
     entities.append(FnOsServiceSwitch(coordinator, entry, "firewall",
                                       "防火墙"))
+    owned: dict = {}
     for row in (coordinator.data.get("docker") or {}).get("containers") or []:
-        if row.get("name"):
-            entities.append(FnOsDockerSwitch(coordinator, entry, row["name"]))
+        name = row.get("name")
+        if name:
+            entity = FnOsDockerSwitch(coordinator, entry, name)
+            entities.append(entity)
+            owned[entity._attr_unique_id] = (KIND_DOCKER, str(name))
     for row in (coordinator.data.get("vms") or {}).get("list") or []:
-        if row.get("name"):
-            entities.append(FnOsVMSwitch(coordinator, entry, row["name"]))
+        name = row.get("name")
+        if name:
+            entity = FnOsVMSwitch(coordinator, entry, name)
+            entities.append(entity)
+            owned[entity._attr_unique_id] = (KIND_VM, str(name))
     async_add_entities(entities)
 
-    # 新容器跟随（60 秒一查，只补缺）
-    from datetime import timedelta
-
-    from homeassistant.helpers.event import async_track_time_interval
-
+    # 新容器/虚拟机跟随：设备与实体由同一份快照驱动，协调器刷新后就补建，
+    # 删除后同轮清理（实体 + 设备），不再等 60 秒定时器。
     known: set = {e._attr_unique_id for e in entities}
+    seen: set = live_dynamic_keys(coordinator.data or {})
 
-    def _track_new(_now=None):
+    @callback
+    def _sync_dynamic(_now=None):
         snap = coordinator.data or {}
+        live = live_dynamic_keys(snap)
+        vanished = seen - live
+        if vanished:
+            removed = purge_dynamic_entities(
+                hass, entry, "switch", vanished, owned, known)
+            seen.difference_update(vanished)
+            _LOGGER.info("fnOS 设备已移除（%s），清理开关实体 %s 个",
+                         ", ".join(key for _kind, key in vanished), removed)
         new = []
-        for row in (snap.get("docker") or {}).get("containers") or []:
-            name = row.get("name")
-            if not name:
-                continue
-            uid = f"{entry.entry_id}-{KIND_DOCKER}-{name}-power"
-            if uid not in known:
-                known.add(uid)
-                new.append(FnOsDockerSwitch(coordinator, entry, name))
-        for row in (snap.get("vms") or {}).get("list") or []:
-            name = row.get("name")
-            if not name:
-                continue
-            uid = f"{entry.entry_id}-{KIND_VM}-{name}-power"
-            if uid not in known:
-                known.add(uid)
-                new.append(FnOsVMSwitch(coordinator, entry, name))
+        try:
+            for row in (snap.get("docker") or {}).get("containers") or []:
+                name = row.get("name")
+                if not name:
+                    continue
+                uid = f"{entry.entry_id}-{KIND_DOCKER}-{name}-power"
+                if uid not in known:
+                    known.add(uid)
+                    owned[uid] = (KIND_DOCKER, str(name))
+                    new.append(FnOsDockerSwitch(coordinator, entry, name))
+            for row in (snap.get("vms") or {}).get("list") or []:
+                name = row.get("name")
+                if not name:
+                    continue
+                uid = f"{entry.entry_id}-{KIND_VM}-{name}-power"
+                if uid not in known:
+                    known.add(uid)
+                    owned[uid] = (KIND_VM, str(name))
+                    new.append(FnOsVMSwitch(coordinator, entry, name))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("fnOS 新增设备开关补建失败")
+            return
+        seen.update(live)
         if new:
+            _LOGGER.info("fnOS 新增设备开关 %s 个（容器/虚拟机）", len(new))
             async_add_entities(new)
 
+    entry.async_on_unload(coordinator.async_add_listener(_sync_dynamic))
     entry.async_on_unload(
-        async_track_time_interval(hass, _track_new, timedelta(seconds=60)))
+        async_track_time_interval(hass, _sync_dynamic, timedelta(seconds=300)))
 
 
 class FnOsServiceSwitch(FnOsEntity, SwitchEntity):
@@ -131,6 +162,8 @@ class FnOsServiceSwitch(FnOsEntity, SwitchEntity):
                 self.coordinator.client.set_service, self._service_key, enabled)
         except FnOsApiError as err:
             raise HomeAssistantError(str(err)) from err
+        # 服务块有 TTL 缓存：操作后必须作废，否则刷新可能读回旧状态
+        self.coordinator.client.invalidate("services")
         await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs):
@@ -170,6 +203,7 @@ class FnOsDockerSwitch(FnOsEntity, SwitchEntity):
                 self._name, row.get("id"), action)
         except FnOsApiError as err:
             raise HomeAssistantError(f"容器 {action} 失败：{err}") from err
+        self.coordinator.client.invalidate("docker")
         await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs):
@@ -275,6 +309,7 @@ class FnOsVMSwitch(FnOsEntity, SwitchEntity):
         except FnOsApiError as err:
             self._clear_optimistic()
             raise HomeAssistantError(f"虚拟机 {action} 失败：{err}") from err
+        self.coordinator.client.invalidate("vms")
         await self.coordinator.async_request_refresh()
 
     async def async_turn_on(self, **kwargs):

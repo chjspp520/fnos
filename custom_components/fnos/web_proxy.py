@@ -21,13 +21,16 @@ import os
 import re
 import secrets
 import time
+from datetime import timedelta
 
 import aiohttp
 from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP
+from homeassistant.core import callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 
 from .const import (
     DATA_KEY,
@@ -38,6 +41,11 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+#: aiohttp 3.13 起 ``aiohttp.WSCloseCode`` 已被移除，改用顶层导出；
+#: 老版本没有顶层导出时回退到 ``aiohttp.web.WSCloseCode``。
+WSCloseCode = getattr(aiohttp, "WSCloseCode", None) or getattr(
+    web, "WSCloseCode", None)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _EMBED_JS = os.path.join(_HERE, "frontend", "fnos-embed.js")
@@ -77,6 +85,9 @@ _REMOTE_STATE_KEY = "remote_control"
 
 #: 开关变化广播：多条目共用同一全局开关，其余条目的开关实体即时刷新显示
 REMOTE_CONTROL_SIGNAL = f"{DOMAIN}_remote_control_changed"
+
+#: 打开相册悬浮窗时广播：让「最近添加」传感器按需刷新（不再定时轮询）
+PHOTO_REFRESH_SIGNAL = f"{DOMAIN}_photo_refresh"
 
 
 def notify_remote_control(hass) -> None:
@@ -152,7 +163,7 @@ async def async_set_remote_control(hass, enabled: bool) -> int:
     for ws_server, ws_client in sessions:
         for ws in (ws_client, ws_server):
             try:
-                await ws.close(code=web.WSCloseCode.POLICY_VIOLATION,
+                await ws.close(code=WSCloseCode.POLICY_VIOLATION,
                                message=b"remote control disabled")
             except Exception:  # pylint: disable=broad-except
                 pass
@@ -804,6 +815,8 @@ def _page_client(hass, entry_id):
     """
     store = _proxy_store(hass)
     clients = store.setdefault("page_clients", {})
+    # 记录最后使用时间：长时间不用就回收（NAS 侧少一条常驻连接）
+    store.setdefault("page_client_used", {})[entry_id] = time.monotonic()
     entry = hass.config_entries.async_get_entry(entry_id)
     if entry is None:
         return None
@@ -830,13 +843,33 @@ def _page_client(hass, entry_id):
 
 def close_page_client(hass, entry_id):
     """关闭并移除某条目的悬浮窗专用客户端（entry 卸载 / HA 停止时调用）。"""
-    clients = _proxy_store(hass).get("page_clients") or {}
+    store = _proxy_store(hass)
+    clients = store.get("page_clients") or {}
+    (store.get("page_client_used") or {}).pop(entry_id, None)
     client = clients.pop(entry_id, None)
     if client is not None:
         try:
             client.close()
         except Exception:  # pylint: disable=broad-except
             pass
+
+
+#: 页客户端空闲多久后回收（秒）：避免「打开过一次悬浮窗」就永久占一条 WS
+PAGE_CLIENT_IDLE_TTL = 30 * 60.0
+
+
+@callback
+def _reap_idle_page_clients(hass):
+    """回收长时间未使用的悬浮窗专用客户端。"""
+    store = _proxy_store(hass)
+    used = store.get("page_client_used") or {}
+    now = time.monotonic()
+    for entry_id in [
+            key for key, ts in used.items()
+            if now - ts > PAGE_CLIENT_IDLE_TTL
+    ]:
+        _LOGGER.debug("回收空闲的 fnOS 页客户端：%s", entry_id)
+        close_page_client(hass, entry_id)
 
 
 def _nav_url(entry_id, target, extra=None, ticket=""):
@@ -1879,6 +1912,8 @@ async def _render_target_page(hass, entry_id, target, query):
         return html_page(
             _file_page_html(hass, entry_id, req_path, payload, ticket))
     if target == "photo":
+        # 打开相册窗口时才刷新「最近添加」传感器（该实体已不再定时轮询）
+        async_dispatcher_send(hass, PHOTO_REFRESH_SIGNAL, entry_id)
         payload = await hass.async_add_executor_job(
             _fetch_photo_payload, hass, entry_id)
         return html_page(_photo_page_html(hass, entry_id, payload, ticket))
@@ -2112,7 +2147,7 @@ class FnOsProxyView(HomeAssistantView):
         except Exception as err:  # pylint: disable=broad-except
             _LOGGER.warning("fnOS WS 上游连接失败：%s（url=%s, protocols=%r）",
                             err, url, protocols, exc_info=True)
-            await ws_server.close(code=web.WSCloseCode.INTERNAL_ERROR,
+            await ws_server.close(code=WSCloseCode.INTERNAL_ERROR,
                                   message=b"upstream unavailable")
             return ws_server
 
@@ -2127,7 +2162,7 @@ class FnOsProxyView(HomeAssistantView):
             if not remote_state["enabled"]:
                 remote_state["sessions"].pop(remote_key, None)
                 await ws_client.close()
-                await ws_server.close(code=web.WSCloseCode.POLICY_VIOLATION,
+                await ws_server.close(code=WSCloseCode.POLICY_VIOLATION,
                                       message=b"remote control disabled")
                 return ws_server
 
@@ -2161,8 +2196,13 @@ class FnOsProxyView(HomeAssistantView):
             if remote_state is not None:
                 remote_state["sessions"].pop(remote_key, None)
                 notify_remote_control(hass)
-            await ws_client.close()
-            await ws_server.close(code=web.WSCloseCode.OK, message=b"")
+            # 集成重载/HA 停止时本任务会被取消：收尾各自兜异常，别把
+            # CancelledError 的二次异常（例如属性不存在）冒到 aiohttp 日志里
+            for ws in (ws_client, ws_server):
+                try:
+                    await ws.close(code=WSCloseCode.OK, message=b"")
+                except (Exception, asyncio.CancelledError):  # noqa: BLE001
+                    pass
         return ws_server
 
     async def get(self, request, entry_id, path=""):
@@ -2723,7 +2763,22 @@ async def async_setup_proxy(hass):
         _LOGGER.warning("注册 fnOS 悬浮窗前端模块失败（不影响独立页面访问）",
                         exc_info=True)
 
+    # 空闲回收：打开过悬浮窗后客户端不会永久占着一条 WS。
+    # 定时器回调会带一个 datetime 参数，必须用闭包包装，不能把 hass 当参数收。
+    @callback
+    def _reap_idle(_now=None):
+        _reap_idle_page_clients(hass)
+
+    store["reaper"] = async_track_time_interval(
+        hass, _reap_idle, timedelta(seconds=300))
+
     async def _on_stop(_event):
+        reaper = store.get("reaper")
+        if reaper is not None:
+            try:
+                reaper()
+            except Exception:  # pylint: disable=broad-except
+                pass
         if store.get("embed_url"):
             try:
                 from homeassistant.components import frontend

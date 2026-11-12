@@ -12,18 +12,24 @@ from homeassistant.components.sensor import (
     SensorStateClass,
 )
 from homeassistant.const import EVENT_STATE_CHANGED, PERCENTAGE
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import EntityCategory
+from homeassistant.helpers.dispatcher import async_dispatcher_connect
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_time_interval,
 )
 
-from . import FnOsEntity, device_identifier
+from . import (
+    FnOsEntity,
+    device_identifier,
+    live_dynamic_keys,
+    purge_dynamic_entities,
+)
 from .api import (
     DISK_WARN_STATES,
     _first_key,
@@ -35,7 +41,11 @@ from .naming import (
     device_token,
     entry_token,
 )
-from .web_proxy import remote_control_enabled
+from .web_proxy import (
+    PHOTO_REFRESH_SIGNAL,
+    REMOTE_CONTROL_SIGNAL,
+    remote_control_enabled,
+)
 from .const import (
     DOMAIN,
     KIND_DOCKER,
@@ -47,6 +57,10 @@ from .const import (
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+#: 轮询实体的扫描间隔（仅影响 should_poll=True 的实体；协调器实体走推送）。
+#: HA 默认 30 秒对「VM 配置 / 相册列表」这类慢数据太频繁，统一放宽到 60 秒。
+SCAN_INTERVAL = timedelta(seconds=60)
 
 
 def _device_by_identifier(hass, entry, identifier):
@@ -100,6 +114,19 @@ def _mb_s(value):
     return round(value / 1048576.0, 2)
 
 
+#: 容量类实体统一单位（固定单位，避免自动换算导致 HA 报「单位已改变」）
+CAPACITY_UNIT = "GB"
+
+
+def _gb(value, digits=2):
+    """字节 → GB（固定单位，缺值返回 None 而不是 0）。"""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return None
+    return round(value / 1073741824.0, digits)
+
+
 def _human_bytes(value):
     """防御式容量展示：按最大单位换算（fnOS 未公开字段单位）。"""
     value = _num(value)
@@ -130,14 +157,23 @@ class FnOsSnapshotSensor(FnOsEntity, SensorEntity):
         self._attr_icon = icon
         self._attrs_fn = attrs_fn
         self._value_fn = value_fn or (lambda snap: None)
+        # 一次状态写入里 native_value / native_unit 各调一次 _value()：
+        # 用快照对象身份做缓存，同一轮只算一遍（避免重复解析）
+        self._value_cache = None
 
     def _value(self):
+        snap = self.snap
+        cached = self._value_cache
+        if cached is not None and cached[0] is snap:
+            return cached[1]
         try:
-            return self._value_fn(self.snap)
+            value = self._value_fn(snap)
         except Exception:  # pylint: disable=broad-except
             _LOGGER.debug("fnOS 传感器 %s 取值异常", self._attr_unique_id,
                           exc_info=True)
-            return None
+            value = None
+        self._value_cache = (snap, value)
+        return value
 
     @property
     def native_value(self):
@@ -171,7 +207,8 @@ class FnOsRemoteAddressSensor(ForcedEntityIdMixin, SensorEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_should_poll = True
+    # 事件驱动：设备注册表变化（链接重签）+ 12 小时续签，不再每 30 秒轮询
+    _attr_should_poll = False
     _attr_icon = "mdi:link-variant"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
@@ -183,6 +220,7 @@ class FnOsRemoteAddressSensor(ForcedEntityIdMixin, SensorEntity):
         self._attr_name = "远程地址"
         self._url = None
         self._base = None
+        self._device_id = None
         self._setup_forced_entity_id(
             "sensor", entry_token(hass, entry),
             device_token(kind, key, title) or "host", "remote")
@@ -203,8 +241,29 @@ class FnOsRemoteAddressSensor(ForcedEntityIdMixin, SensorEntity):
     def extra_state_attributes(self):
         return {"url": self._url} if self._url else {}
 
-    async def async_update(self):
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self._refresh()
+        self.async_on_remove(self.hass.bus.async_listen(
+            dr.EVENT_DEVICE_REGISTRY_UPDATED, self._handle_device_event))
+        # 链接 24h 有效：每 12 小时续签一次（基地址变化由 origin 重签并触发事件）
+        self.async_on_remove(async_track_time_interval(
+            self.hass, self._async_periodic, timedelta(hours=12)))
+
+    @callback
+    def _handle_device_event(self, event):
+        if event.data.get("device_id") != self._device_id:
+            return
+        self._refresh()
+        self.async_write_ha_state()
+
+    async def _async_periodic(self, _now=None):
+        self._refresh()
+        self.async_write_ha_state()
+
+    def _refresh(self):
         device = _device_by_identifier(self.hass, self.entry, self._identifier)
+        self._device_id = getattr(device, "id", None)
         self._url = getattr(device, "configuration_url", None) if device else None
         self._base = None
         if self._url:
@@ -228,7 +287,8 @@ class FnOsConsoleAddressSensor(ForcedEntityIdMixin, SensorEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_should_poll = True
+    # 事件驱动：设备链接变化 / 远程控制开关切换 / 12 小时续签
+    _attr_should_poll = False
     _attr_icon = "mdi:console"
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
@@ -240,6 +300,7 @@ class FnOsConsoleAddressSensor(ForcedEntityIdMixin, SensorEntity):
         self._attr_name = "控制台地址"
         self._url = None
         self._base = None
+        self._device_id = None
         self._setup_forced_entity_id(
             "sensor", entry_token(hass, entry),
             device_token(KIND_VM, name, title), "console")
@@ -265,10 +326,38 @@ class FnOsConsoleAddressSensor(ForcedEntityIdMixin, SensorEntity):
             return {}
         return {"url": self._url} if self._url else {}
 
-    async def async_update(self):
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self._refresh()
+        self.async_on_remove(self.hass.bus.async_listen(
+            dr.EVENT_DEVICE_REGISTRY_UPDATED, self._handle_device_event))
+        # 总开关切换：关闭要立刻改文案/隐藏链接，开启要立刻重签
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, REMOTE_CONTROL_SIGNAL, self._handle_remote_control))
+        self.async_on_remove(async_track_time_interval(
+            self.hass, self._async_periodic, timedelta(hours=12)))
+
+    @callback
+    def _handle_device_event(self, event):
+        if event.data.get("device_id") != self._device_id:
+            return
+        self._refresh()
+        self.async_write_ha_state()
+
+    @callback
+    def _handle_remote_control(self):
+        self._refresh()
+        self.async_write_ha_state()
+
+    async def _async_periodic(self, _now=None):
+        self._refresh()
+        self.async_write_ha_state()
+
+    def _refresh(self):
         if not remote_control_enabled(self.hass):
-            return  # 关闭期间不重签；重新开启后下一轮自动恢复
+            return  # 关闭期间不重签；重新开启时由总开关广播触发刷新
         device = _device_by_identifier(self.hass, self.entry, self._identifier)
+        self._device_id = getattr(device, "id", None)
         url = getattr(device, "configuration_url", None) if device else None
         self._url = None
         self._base = None
@@ -299,11 +388,13 @@ class FnOsRecentPhotosSensor(ForcedEntityIdMixin, SensorEntity):
     属性「原图下载地址」为最近 60 张的原图代理链接。
 
     链接走 HA 的 /fnos/web/img 流代理并附官方 authSig 签名（24h 有效，
-    本传感器轮询时自动重签），长期可点开；相册原图不对外暴露 fnOS 地址。
+    每次打开相册窗口时重签），长期可点开；相册原图不对外暴露 fnOS 地址。
     """
 
     _attr_has_entity_name = True
-    _attr_should_poll = True
+    # 按需刷新：打开相册悬浮窗时广播（web_proxy → PHOTO_REFRESH_SIGNAL），
+    # 不再定时轮询——没人看相册就不产生任何请求
+    _attr_should_poll = False
     _attr_icon = "mdi:image-multiple"
 
     def __init__(self, hass, entry, identifier):
@@ -314,6 +405,7 @@ class FnOsRecentPhotosSensor(ForcedEntityIdMixin, SensorEntity):
         self._attr_name = "最近添加"
         self._time = None
         self._urls = None
+        self._last_fetch = 0.0
         self._setup_forced_entity_id(
             "sensor", entry_token(hass, entry), "photo", "recent")
 
@@ -335,12 +427,33 @@ class FnOsRecentPhotosSensor(ForcedEntityIdMixin, SensorEntity):
             return None
         return {"数量": len(self._urls), "原图下载地址": self._urls}
 
-    async def async_update(self):
+    #: 同一窗口内可能连开多次（切子目录等）：10 秒内只拉一次
+    PHOTO_MIN_INTERVAL = 10.0
+
+    async def async_added_to_hass(self):
+        await super().async_added_to_hass()
+        self.async_on_remove(async_dispatcher_connect(
+            self.hass, PHOTO_REFRESH_SIGNAL, self._handle_refresh_request))
+        # 启动先拉一次，否则实体要等到第一次打开相册窗口才有值
+        self.hass.async_create_task(self._async_load())
+
+    @callback
+    def _handle_refresh_request(self, entry_id=None):
+        """打开相册悬浮窗时按需刷新（其它条目的广播忽略）。"""
+        if entry_id and entry_id != self.entry.entry_id:
+            return
+        self.hass.async_create_task(self._async_load())
+
+    async def _async_load(self):
+        now = time.monotonic()
+        if now - self._last_fetch < self.PHOTO_MIN_INTERVAL:
+            return
         store = self.hass.data.get(DOMAIN) or {}
         coord = (store.get(self.entry.entry_id) or {}).get("coordinator")
         client = getattr(coord, "client", None)
         if client is None:
             return
+        self._last_fetch = now
         try:
             photos = await self.hass.async_add_executor_job(
                 client.photo_recent, 0, 60)
@@ -350,6 +463,7 @@ class FnOsRecentPhotosSensor(ForcedEntityIdMixin, SensorEntity):
         if not photos:
             self._time = None
             self._urls = None
+            self.async_write_ha_state()
             return
         from urllib.parse import quote
 
@@ -383,6 +497,7 @@ class FnOsRecentPhotosSensor(ForcedEntityIdMixin, SensorEntity):
         date, _, tm = latest.partition(" ")
         self._time = (f"{date.replace(':', '-')} {tm[:5]}"
                       if tm else (date or None))
+        self.async_write_ha_state()
 
 
 # 设备 kind → (分组排序, 中文名)；未列出的 kind 归入「其他」
@@ -428,7 +543,8 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
     """
 
     _attr_has_entity_name = True
-    _attr_should_poll = True
+    # 事件驱动 + 5 分钟兜底（原来 30 秒轮询会无条件重写整包大属性）
+    _attr_should_poll = False
     _attr_icon = "mdi:format-list-bulleted-square"
     # 整包属性不写数据库（状态机/模板仍然可读）
     _unrecorded_attributes = frozenset(
@@ -448,6 +564,9 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
         self._ids: set = set()
         self._pending = None
         self._refresh_handle = None
+        # 值级签名：目录/状态没变就不重写大属性（省 state 机与前端渲染）
+        self._sig = None
+        self._force_write = False
         # 固定英文实体 ID：sensor.fnos_all_entities
         # （多条目时为 sensor.fnos_<主机>_all_entities，避免抢号）
         self._setup_forced_entity_id(
@@ -480,7 +599,10 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
         self.async_on_remove(self.hass.bus.async_listen(
             dr.EVENT_DEVICE_REGISTRY_UPDATED, self._handle_device_event))
         self.async_on_remove(self._cancel_timers)
+        self.async_on_remove(async_track_time_interval(
+            self.hass, self._async_poll, timedelta(seconds=300)))
         self._payload = self._build_payload()  # 首次先把 _ids 建出来
+        self._sig = self._states_signature()
 
     def _cancel_timers(self):
         for timer in (self._pending, self._refresh_handle):
@@ -491,16 +613,44 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
 
     async def _flush_soon(self, _now=None):
         self._pending = None
-        self._payload = None
-        self.async_write_ha_state()
+        self._write_if_changed()
 
     async def _refresh_now(self, _now=None):
         self._refresh_handle = None
+        self._write_if_changed()
+
+    async def _async_poll(self, _now=None):
+        """5 分钟兜底：只在签名变化时重写，防止漏事件导致属性陈旧。"""
+        self._write_if_changed()
+
+    def _states_signature(self):
+        """轻量签名：实体集合 + 每个实体的状态与变更时间。"""
+        states = self.hass.states
+        parts = []
+        for entity_id in sorted(self._ids):
+            state = states.get(entity_id)
+            parts.append(
+                (entity_id, state.state, state.last_changed)
+                if state is not None else (entity_id, None))
+        return tuple(parts)
+
+    def _write_if_changed(self):
+        """签名没变就什么都不做（避免每轮重写整包大属性）。"""
+        sig = self._states_signature()
+        if not self._force_write and sig == self._sig:
+            return
+        self._force_write = False
+        self._sig = sig
         self._payload = None
         self.async_write_ha_state()
 
+    @callback
     def _handle_state_changed(self, event):
-        """只关心本集成的实体；合并 5 秒刷新一次，别把大属性反复写。"""
+        """只关心本集成的实体；合并 5 秒刷新一次，别把大属性反复写。
+
+        必须是 ``@callback``：否则 HA 会把同步回调丢进执行器线程，
+        里面调 ``async_call_later`` 就是跨线程操作事件循环（会崩 Core）。
+        """
         entity_id = (event.data or {}).get("entity_id")
         if (not entity_id or entity_id == self.entity_id
                 or entity_id not in self._ids):
@@ -511,11 +661,14 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
             self.hass, self._FLUSH_DELAY, self._flush_soon)
 
     def _schedule_refresh(self):
+        """注册表变化（改名/改图标/增删）→ 强制重写一次。"""
+        self._force_write = True
         if self._refresh_handle is not None:
             return
         self._refresh_handle = async_call_later(
             self.hass, 1.0, self._refresh_now)
 
+    @callback
     def _handle_registry_event(self, event):
         entity_id = event.data.get("entity_id")
         if not entity_id:
@@ -528,6 +681,7 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
         if entity is not None and entity.config_entry_id == self.entry.entry_id:
             self._schedule_refresh()
 
+    @callback
     def _handle_device_event(self, event):
         device_id = event.data.get("device_id")
         if not device_id:
@@ -537,12 +691,14 @@ class FnOsAllEntitiesSensor(ForcedEntityIdMixin, SensorEntity):
             # 删除事件：设备已经不在注册表里，无法判断归属 → 廉价重建一次
             self._schedule_refresh()
             return
-        if self.entry.entry_id in device.config_entries:
+        # 新版 HA：设备只属于一个配置条目（config_entries 已弃用，2027.10 失效）
+        entry_id = getattr(device, "config_entry_id", None)
+        if entry_id is None:  # 老版本回退到集合
+            entry_id = next(iter(device.config_entries), None)
+        if entry_id == self.entry.entry_id:
             self._schedule_refresh()
 
-    async def async_update(self):
-        """30 秒轮询兜底：只清缓存，重建发生在写状态时（懒加载）。"""
-        self._payload = None
+    # 轮询已取消（_attr_should_poll = False）：事件 + 5 分钟签名比对足够
 
     # -- 分类与汇总 ------------------------------------------------------ #
     def _classify(self, device):
@@ -690,10 +846,14 @@ def _container(snap, key):
 _VM_INFO_CACHE: dict = {}
 
 
-async def _vm_info_cached(hass, coordinator, name, ttl=60.0):
-    """带 TTL 的 vm_info；失败时回退上次结果。"""
+async def _vm_info_cached(hass, coordinator, name, ttl=300.0, scope=""):
+    """带 TTL 的 vm_info；失败时回退上次结果。
+
+    ``scope`` 用配置条目 id：多台 NAS 上同名虚拟机会撞 key，必须分开缓存。
+    """
+    key = (scope, name)
     now = time.monotonic()
-    hit = _VM_INFO_CACHE.get(name)
+    hit = _VM_INFO_CACHE.get(key)
     if hit and now - hit[0] < ttl:
         return hit[1]
     client = getattr(coordinator, "client", None)
@@ -705,7 +865,7 @@ async def _vm_info_cached(hass, coordinator, name, ttl=60.0):
         _LOGGER.debug("fnOS vm_info 获取失败: %s", name, exc_info=True)
         return hit[1] if hit else None
     info = info or {}
-    _VM_INFO_CACHE[name] = (now, info)
+    _VM_INFO_CACHE[key] = (now, info)
     return info
 
 
@@ -755,7 +915,8 @@ class FnOsVmInfoSensor(ForcedEntityIdMixin, SensorEntity):
 
     async def async_update(self):
         info = await _vm_info_cached(
-            self.hass, self._coordinator, self._vm)
+            self.hass, self._coordinator, self._vm,
+            scope=self.entry.entry_id)
         if not info:
             self._value = None
             self._attrs = None
@@ -773,10 +934,10 @@ class FnOsVmInfoSensor(ForcedEntityIdMixin, SensorEntity):
 
 def _vm_mem_parse(info):
     raw = info.get("memCapacityInBytes")
-    val = _human_bytes(raw)
+    val = _gb(raw)
     if val is None:
-        return None, None, {"raw": raw}
-    return val[0], val[1], {"raw": raw}
+        return None, CAPACITY_UNIT, {"raw": raw}
+    return val, CAPACITY_UNIT, {"raw": raw}
 
 
 def _vm_disk_parse(info):
@@ -796,9 +957,8 @@ def _vm_disk_parse(info):
             "容量": f"{unit[0]} {unit[1]}" if unit else None,
         })
     if not total:
-        return None, None, None
-    val = _human_bytes(total)
-    return val[0], val[1], {"磁盘数": len(disks), "明细": detail}
+        return None, CAPACITY_UNIT, None
+    return _gb(total), CAPACITY_UNIT, {"磁盘数": len(disks), "明细": detail}
 
 
 def _vm_mac_parse(info):
@@ -1320,37 +1480,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
     entities: list = []
     entities.extend(_host_sensors(coordinator, entry))
     entities.extend(_file_sensors(coordinator, entry))
-    entities.extend(_docker_sensors(coordinator, entry))
-    entities.extend(_vm_sensors(hass, coordinator, entry))
-
-    remote_specs = [
-        (device_identifier(entry, KIND_HOST), KIND_HOST, "", ""),
-        (device_identifier(entry, KIND_FILE), KIND_FILE, "", ""),
-        (device_identifier(entry, KIND_PHOTO), KIND_PHOTO, "", ""),
-        (device_identifier(entry, KIND_VIDEO), KIND_VIDEO, "", ""),
-    ]
-    vm_specs = []
-    for row in (coordinator.data.get("docker") or {}).get("containers") or []:
-        if row.get("name"):
-            remote_specs.append((device_identifier(entry, KIND_DOCKER,
-                                                   row["name"]),
-                                 KIND_DOCKER, row["name"], ""))
-    for vm in (coordinator.data.get("vms") or {}).get("list") or []:
-        vm_name = str(vm.get("name") or "")
-        if vm_name:
-            vm_title = str(vm.get("title") or "")
-            vm_ident = device_identifier(entry, KIND_VM, vm_name)
-            remote_specs.append((vm_ident, KIND_VM, vm_name, vm_title))
-            vm_specs.append((vm_ident, vm_name, vm_title))
+    # 静态设备的「远程地址」传感器（容器/虚拟机由 _dynamic_sensors 一并给出）
     entities.extend(
-        FnOsRemoteAddressSensor(hass, entry, ident, kind, key, title)
-        for ident, kind, key, title in remote_specs
+        FnOsRemoteAddressSensor(hass, entry, ident, kind, "", "")
+        for ident, kind in (
+            (device_identifier(entry, KIND_HOST), KIND_HOST),
+            (device_identifier(entry, KIND_FILE), KIND_FILE),
+            (device_identifier(entry, KIND_PHOTO), KIND_PHOTO),
+            (device_identifier(entry, KIND_VIDEO), KIND_VIDEO),
+        )
     )
-    # 虚拟机设备额外提供「控制台地址」传感器（target=vmconsole 链接）
-    entities.extend(
-        FnOsConsoleAddressSensor(hass, entry, ident, name, title)
-        for ident, name, title in vm_specs
-    )
+    # 容器 / 虚拟机：状态与性能传感器 + 远程地址（虚拟机另有控制台地址）
+    dynamic = _dynamic_sensors(hass, coordinator, entry, coordinator.data or {})
+    entities.extend(dynamic)
     # 相册设备提供「最近添加」传感器（60 张原图下载地址 + 最新时间）
     entities.append(
         FnOsRecentPhotosSensor(hass, entry,
@@ -1360,28 +1502,55 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
 
     async_add_entities(entities)
 
-    # 容器/虚拟机增删跟随：闭包记录已建 unique_id，60 秒一查，只补缺
+    # 容器/虚拟机增删跟随：记住已建 unique_id，协调器每轮刷新后补缺。
+    # 设备（__init__.snapshot_devices）与实体都由同一份快照驱动，因此设备一
+    # 出现，实体就在同一轮刷新里补上，不再依赖 60 秒定时轮询。
     known: set = {e._attr_unique_id for e in entities}
+    # 动态实体归属：unique_id → (kind, key)，设备被删时据此精准清理
+    owned: dict = {}
+    for entity in dynamic:
+        owner = _entity_device_key(entity)
+        if owner:
+            owned[entity._attr_unique_id] = owner
+    seen: set = live_dynamic_keys(coordinator.data or {})
 
-    def _track_new(_now=None):
+    @callback
+    def _sync_dynamic(_now=None):
+        """容器/虚拟机跟随：新增补建实体，删除清理实体与设备。"""
         snap = coordinator.data or {}
-        new_entities = []
-        for row in (snap.get("docker") or {}).get("containers") or []:
-            if row.get("name"):
-                new_entities.extend(_docker_sensors(
-                    coordinator, entry, only_name=row["name"], known=known))
-        for vm in (snap.get("vms") or {}).get("list") or []:
-            vm_name = str(vm.get("name") or "")
-            if vm_name:
-                new_entities.extend(_vm_sensors(
-                    hass, coordinator, entry,
-                    only_name=vm_name, known=known))
+        live = live_dynamic_keys(snap)
+        vanished = seen - live
+        if vanished:
+            removed = purge_dynamic_entities(
+                hass, entry, "sensor", vanished, owned, known)
+            seen.difference_update(vanished)
+            _LOGGER.info("fnOS 设备已移除（%s），清理传感器实体 %s 个",
+                         ", ".join(key for _kind, key in vanished), removed)
+        try:
+            new_entities = _dynamic_sensors(hass, coordinator, entry, snap, known)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("fnOS 新增容器/虚拟机实体补建失败")
+            return
+        seen.update(live)
+        if not new_entities:
+            return
+        for entity in new_entities:
+            owner = _entity_device_key(entity)
+            if owner:
+                owned[entity._attr_unique_id] = owner
         known.update(e._attr_unique_id for e in new_entities)
-        if new_entities:
-            async_add_entities(new_entities)
+        _LOGGER.info("fnOS 新增设备实体 %s 个（容器/虚拟机）", len(new_entities))
+        async_add_entities(new_entities)
+        try:  # 新设备的「访问」链接需要按当前基地址补签
+            from .origin import schedule_device_links
+        except ImportError:  # pragma: no cover - 理论不可达
+            return
+        schedule_device_links(hass, entry.entry_id)
 
+    entry.async_on_unload(coordinator.async_add_listener(_sync_dynamic))
+    # 兜底：某轮补建失败后仍会随刷新重试，这里再留一条低频保险
     entry.async_on_unload(
-        async_track_time_interval(hass, _track_new, timedelta(seconds=60)))
+        async_track_time_interval(hass, _sync_dynamic, timedelta(seconds=300)))
 
 
 # --------------------------------------------------------------------------- #
@@ -1412,12 +1581,14 @@ def _host_sensors(coordinator, entry):
                 "swap_total": _human_bytes(resmon(s).get("swap_total"))}),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "mem_used", "内存已用",
-            state_class=SensorStateClass.MEASUREMENT, icon="mdi:memory",
-            value_fn=lambda s: _human_bytes(resmon(s).get("mem_used"))),
+            unit=CAPACITY_UNIT, state_class=SensorStateClass.MEASUREMENT,
+            icon="mdi:memory",
+            value_fn=lambda s: _gb(resmon(s).get("mem_used"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "mem_total", "内存总量",
-            icon="mdi:memory", entity_category=EntityCategory.DIAGNOSTIC,
-            value_fn=lambda s: _human_bytes(resmon(s).get("mem_total"))),
+            unit=CAPACITY_UNIT, icon="mdi:memory",
+            entity_category=EntityCategory.DIAGNOSTIC,
+            value_fn=lambda s: _gb(resmon(s).get("mem_total"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "gpu", "GPU 使用率",
             unit=PERCENTAGE, state_class=SensorStateClass.MEASUREMENT,
@@ -1458,12 +1629,12 @@ def _host_sensors(coordinator, entry):
             value_fn=lambda s: _uptime_dt(host(s).get("uptime_seconds"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "storage_total", "存储总容量",
-            icon="mdi:database",
-            value_fn=lambda s: _human_bytes(storage(s).get("total"))),
+            unit=CAPACITY_UNIT, icon="mdi:database",
+            value_fn=lambda s: _gb(storage(s).get("total"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "storage_free", "存储可用容量",
-            icon="mdi:database-check",
-            value_fn=lambda s: _human_bytes(storage(s).get("free"))),
+            unit=CAPACITY_UNIT, icon="mdi:database-check",
+            value_fn=lambda s: _gb(storage(s).get("free"))),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "disk_count", "硬盘数量",
             state_class=SensorStateClass.MEASUREMENT, icon="mdi:harddisk",
@@ -1580,8 +1751,8 @@ def _host_sensors(coordinator, entry):
                 host(s).get("uptime_seconds"))}),
         FnOsSnapshotSensor(
             coordinator, entry, kind, "", "storage_used", "存储已用容量",
-            icon="mdi:database-arrow-right",
-            value_fn=lambda s: _human_bytes(storage(s).get("used")),
+            unit=CAPACITY_UNIT, icon="mdi:database-arrow-right",
+            value_fn=lambda s: _gb(storage(s).get("used")),
             attrs_fn=lambda s: {"raw": storage(s).get("used")}),
         FnOsStoragePoolSensor(coordinator, entry),
         FnOsSnapshotSensor(
@@ -1687,15 +1858,12 @@ def _file_sensors(coordinator, entry):
 # --------------------------------------------------------------------------- #
 # Docker 容器 / 虚拟机传感器
 # --------------------------------------------------------------------------- #
-def _docker_sensors(coordinator, entry, only_name=None, known=None):
+def _docker_sensors(coordinator, entry, only_name=None):
     kind = KIND_DOCKER
     sensors = []
     for row in (coordinator.data.get("docker") or {}).get("containers") or []:
         name = row.get("name")
         if not name or (only_name is not None and name != only_name):
-            continue
-        uid_base = f"{entry.entry_id}-{kind}-{name}"
-        if known is not None and f"{uid_base}-state" in known:
             continue
 
         def get_row(s, n=name):
@@ -1739,7 +1907,7 @@ def _docker_sensors(coordinator, entry, only_name=None, known=None):
     return sensors
 
 
-def _vm_sensors(hass, coordinator, entry, only_name=None, known=None):
+def _vm_sensors(hass, coordinator, entry, only_name=None):
     """每台虚拟机一组传感器；key 与设备注册一致，统一用 name。"""
     kind = KIND_VM
     sensors = []
@@ -1748,9 +1916,6 @@ def _vm_sensors(hass, coordinator, entry, only_name=None, known=None):
         if not vm_name or (only_name is not None and vm_name != only_name):
             continue
         vm_title = str(vm.get("title") or "")
-        uid_base = f"{entry.entry_id}-{kind}-{vm_name}"
-        if known is not None and f"{uid_base}-state" in known:
-            continue
 
         def get_vm(s, n=vm_name):
             for row in (s.get("vms") or {}).get("list") or []:
@@ -1811,3 +1976,61 @@ def _vm_sensors(hass, coordinator, entry, only_name=None, known=None):
                 value_fn=lambda s, f=get_vm: (f(s).get("os") or "未知")),
         ])
     return sensors
+
+
+def _entity_device_key(entity):
+    """动态实体 → 所属设备 ``(kind, key)``；解析不出返回 None。"""
+    kind = getattr(entity, "kind", "")
+    if kind:
+        return (kind, getattr(entity, "key", ""))
+    identifier = getattr(entity, "_identifier", "") or ""
+    parts = identifier.split(":", 2)
+    if len(parts) >= 2:
+        return (parts[1], parts[2] if len(parts) > 2 else "")
+    return None
+
+
+def _dynamic_sensors(hass, coordinator, entry, snap, known=None):
+    """容器 / 虚拟机设备的全部实体（启动装配与运行期补建共用）。
+
+    每个设备包含：状态与性能传感器 + 「远程地址」；虚拟机另有「控制台地址」。
+    ``known`` 是已创建实体的 unique_id 集合——传了就只返回缺的那些。新增容器/
+    虚拟机由协调器刷新事件触发本函数补建，因此设备一出现实体就跟着出现。
+    """
+    seen = set(known or ())
+    result: list = []
+
+    def take(entity):
+        uid = (getattr(entity, "unique_id", None)
+               or getattr(entity, "_attr_unique_id", None))
+        if uid:
+            if uid in seen:
+                return
+            seen.add(uid)
+        result.append(entity)
+
+    for row in (snap.get("docker") or {}).get("containers") or []:
+        name = row.get("name")
+        if not name:
+            continue
+        if f"{entry.entry_id}-{KIND_DOCKER}-{name}-state" not in seen:
+            for entity in _docker_sensors(coordinator, entry, only_name=name):
+                take(entity)
+        take(FnOsRemoteAddressSensor(
+            hass, entry, device_identifier(entry, KIND_DOCKER, name),
+            KIND_DOCKER, name, ""))
+
+    for vm in (snap.get("vms") or {}).get("list") or []:
+        vm_name = str(vm.get("name") or "")
+        if not vm_name:
+            continue
+        vm_title = str(vm.get("title") or "")
+        ident = device_identifier(entry, KIND_VM, vm_name)
+        if f"{entry.entry_id}-{KIND_VM}-{vm_name}-state" not in seen:
+            for entity in _vm_sensors(hass, coordinator, entry,
+                                      only_name=vm_name):
+                take(entity)
+        take(FnOsRemoteAddressSensor(hass, entry, ident, KIND_VM,
+                                     vm_name, vm_title))
+        take(FnOsConsoleAddressSensor(hass, entry, ident, vm_name, vm_title))
+    return result

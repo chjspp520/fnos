@@ -176,6 +176,15 @@ def _schedule_relink(hass, entry_id, delay=1.5):
     tasks[entry_id] = hass.async_create_task(_do_relink())
 
 
+def schedule_device_links(hass, entry_id, delay=1.5):
+    """新增容器/虚拟机后补签「访问」链接（幂等防抖）。
+
+    设备链接是 ``configuration_url``，新设备创建时还没有地址；传感器平台补建
+    实体后调用本函数，按当前基地址把链接签上。
+    """
+    _schedule_relink(hass, entry_id, delay)
+
+
 async def remember_origin_for_all_entries(hass, request):
     """前端心跳：用浏览器当前地址栏来源更新所有未显式配置的条目。"""
     origin = _normalize_base(str(request.url.origin()))

@@ -2,15 +2,21 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 
 from homeassistant.components.button import ButtonEntity
-from homeassistant.core import HomeAssistant
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.event import async_track_time_interval
 
-from . import FnOsEntity
+from . import (
+    FnOsEntity,
+    live_dynamic_keys,
+    purge_dynamic_entities,
+)
 from .api import FnOsApiError
 from .const import DOMAIN, KIND_DOCKER, KIND_HOST, KIND_VM
 
@@ -26,51 +32,74 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry,
         FnOsPowerButton(coordinator, entry, "reboot", "重启"),
         FnOsPowerButton(coordinator, entry, "poweroff", "关机"),
     ]
+    owned: dict = {}
     for row in (coordinator.data.get("docker") or {}).get("containers") or []:
-        if row.get("name"):
-            entities.append(FnOsDockerRestartButton(coordinator, entry,
-                                                    row["name"]))
+        name = row.get("name")
+        if name:
+            entity = FnOsDockerRestartButton(coordinator, entry, name)
+            entities.append(entity)
+            owned[entity._attr_unique_id] = (KIND_DOCKER, str(name))
     for row in (coordinator.data.get("vms") or {}).get("list") or []:
-        if row.get("name"):
-            entities.append(FnOsVMButton(coordinator, entry, row["name"],
-                                         "reboot", "重启"))
-            entities.append(FnOsVMButton(coordinator, entry, row["name"],
-                                         "forceshutdown", "强制关机"))
+        name = row.get("name")
+        if not name:
+            continue
+        for action, label in (("reboot", "重启"),
+                              ("forceshutdown", "强制关机")):
+            entity = FnOsVMButton(coordinator, entry, name, action, label)
+            entities.append(entity)
+            owned[entity._attr_unique_id] = (KIND_VM, str(name))
     async_add_entities(entities)
 
-    from datetime import timedelta
-
-    from homeassistant.helpers.event import async_track_time_interval
-
+    # 新容器/虚拟机跟随：协调器刷新后立即补建 / 删除后同轮清理
     known: set = {e._attr_unique_id for e in entities}
+    seen: set = live_dynamic_keys(coordinator.data or {})
 
-    def _track_new(_now=None):
+    @callback
+    def _sync_dynamic(_now=None):
         snap = coordinator.data or {}
+        live = live_dynamic_keys(snap)
+        vanished = seen - live
+        if vanished:
+            removed = purge_dynamic_entities(
+                hass, entry, "button", vanished, owned, known)
+            seen.difference_update(vanished)
+            _LOGGER.info("fnOS 设备已移除（%s），清理按钮实体 %s 个",
+                         ", ".join(key for _kind, key in vanished), removed)
         new = []
-        for row in (snap.get("docker") or {}).get("containers") or []:
-            name = row.get("name")
-            if not name:
-                continue
-            uid = f"{entry.entry_id}-{KIND_DOCKER}-{name}-restart"
-            if uid not in known:
-                known.add(uid)
-                new.append(FnOsDockerRestartButton(coordinator, entry, name))
-        for row in (snap.get("vms") or {}).get("list") or []:
-            name = row.get("name")
-            if not name:
-                continue
-            for action in ("reboot", "forceshutdown"):
-                uid = f"{entry.entry_id}-{KIND_VM}-{name}-{action}"
+        try:
+            for row in (snap.get("docker") or {}).get("containers") or []:
+                name = row.get("name")
+                if not name:
+                    continue
+                uid = f"{entry.entry_id}-{KIND_DOCKER}-{name}-restart"
                 if uid not in known:
                     known.add(uid)
-                    label = "重启" if action == "reboot" else "强制关机"
-                    new.append(FnOsVMButton(coordinator, entry, name,
-                                            action, label))
+                    owned[uid] = (KIND_DOCKER, str(name))
+                    new.append(FnOsDockerRestartButton(coordinator, entry,
+                                                       name))
+            for row in (snap.get("vms") or {}).get("list") or []:
+                name = row.get("name")
+                if not name:
+                    continue
+                for action, label in (("reboot", "重启"),
+                                      ("forceshutdown", "强制关机")):
+                    uid = f"{entry.entry_id}-{KIND_VM}-{name}-{action}"
+                    if uid not in known:
+                        known.add(uid)
+                        owned[uid] = (KIND_VM, str(name))
+                        new.append(FnOsVMButton(coordinator, entry, name,
+                                                action, label))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("fnOS 新增设备按钮补建失败")
+            return
+        seen.update(live)
         if new:
+            _LOGGER.info("fnOS 新增设备按钮 %s 个（容器/虚拟机）", len(new))
             async_add_entities(new)
 
+    entry.async_on_unload(coordinator.async_add_listener(_sync_dynamic))
     entry.async_on_unload(
-        async_track_time_interval(hass, _track_new, timedelta(seconds=60)))
+        async_track_time_interval(hass, _sync_dynamic, timedelta(seconds=300)))
 
 
 class FnOsPowerButton(FnOsEntity, ButtonEntity):
@@ -118,6 +147,7 @@ class FnOsDockerRestartButton(FnOsEntity, ButtonEntity):
                 self._name, row.get("id"), "restart")
         except FnOsApiError as err:
             raise HomeAssistantError(f"容器重启失败：{err}") from err
+        self.coordinator.client.invalidate("docker")
         await self.coordinator.async_request_refresh()
 
 
@@ -150,4 +180,5 @@ class FnOsVMButton(FnOsEntity, ButtonEntity):
                 self.coordinator.client.vm_action, self._name, self._action)
         except FnOsApiError as err:
             raise HomeAssistantError(f"虚拟机 {self._action} 失败：{err}") from err
+        self.coordinator.client.invalidate("vms")
         await self.coordinator.async_request_refresh()

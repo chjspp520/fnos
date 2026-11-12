@@ -182,6 +182,15 @@ class FnOsClient:
         # VM App REST 客户端：懒创建（build_opener 内部 load_default_certs
         # 是阻塞调用，绝不能在事件循环里做——首次使用发生在 executor 线程）
         self._http_opener = None
+        # 数据块缓存：{key: (取到时间, 值)}，用于分层刷新与失败沿用旧值
+        self._cache = {}
+        # 能力探测：无独显 / 非 trim 硬件无风扇时跳过对应接口（10 分钟复探一次）
+        self._gpu_present = None
+        self._gpu_probe_at = 0.0
+        self._has_fan = None
+        self._fan_probe_at = 0.0
+        # 下载中心未安装 → 10 分钟内不再探测
+        self._download_missing_until = 0.0
 
     # ------------------------------------------------------------------ #
     # 连接 / 登录
@@ -322,7 +331,7 @@ class FnOsClient:
         ).decode()
         return sig + body_text
 
-    def _raw_request(self, rid, frame_text, timeout=30):
+    def _raw_request(self, rid, frame_text, timeout=10):
         if self._ws is None:
             raise FnOsApiError("fnOS WebSocket 未连接")
         with self._pending_cond:
@@ -346,7 +355,7 @@ class FnOsClient:
                     raise FnOsApiError(f"fnOS 请求超时（{timeout}s）：等待响应")
                 self._pending_cond.wait(remain)
 
-    def request(self, req, timeout=30, retry_login=True, **params):
+    def request(self, req, timeout=10, retry_login=True, **params):
         """发起一次 WS 请求；连接失效自动重连重登一次。"""
         with self._lock:
             if self._ws is None or not self._logged_in:
@@ -397,7 +406,7 @@ class FnOsClient:
             return default
         return resp.get("data") if "data" in resp else {}
 
-    def payload(self, req, timeout=30, **params):
+    def payload(self, req, timeout=10, **params):
         """容错取数：优先 data 字段；实测部分接口把业务字段平铺在顶层
         （stor.calcSpace / user.listLoginDevice / notify.unreadTotal 等），
         此时剥离协议字段后返回顶层。任何失败返回 {}。"""
@@ -418,7 +427,7 @@ class FnOsClient:
                 if k not in ("reqid", "result", "rev", "req", "errno",
                              "errmsg")}
 
-    def _stream_call(self, method, timeout=25, **params):
+    def _stream_call(self, method, timeout=15, **params):
         """subscribe 型接口（docker 系）：响应以多帧 rsp 片段推送，
         参数必须顶层平铺（如 all=True），聚合到 result=succ/fail 终态。
         实测：appcgi.dockermgr.containerList/stats 均为此模式。"""
@@ -472,47 +481,130 @@ class FnOsClient:
             )
         return resp.get("data") if "data" in resp else {}
 
+    @property
+    def connected(self) -> bool:
+        """WS 是否处于「已连接且已登录」状态（诊断信息用）。"""
+        return bool(self._ws is not None and self._logged_in)
+
     def close(self):
         self._closed = True
+        self._cache.clear()
         self._close_ws()
 
     # ------------------------------------------------------------------ #
     # 数据快照
     # ------------------------------------------------------------------ #
-    def fetch_all(self):
-        """拉一轮全量快照；单接口失败不影响其余字段。"""
-        snap: dict = {}
-        snap["host"] = self._fetch_host()
-        snap["resmon"] = self._fetch_resmon()
-        snap["storage"] = self._fetch_storage()
-        snap["net"] = self._fetch_net()
-        snap["services"] = self._fetch_services()
-        snap["update"] = self._fetch_update()
-        snap["notify_unread"] = self.payload(
-            "notify.unreadTotal").get("unreadTotal") or 0
+    def _cached(self, key, ttl, loader):
+        """按 key 做 TTL 缓存；本轮取不到数据时沿用上一次成功值。
+
+        TTL 让「版本号 / 服务开关 / 应用可用性」这类慢变数据不必每轮都打 NAS；
+        取数失败（空结果或异常）返回旧值，避免实体在 60/0/未知 之间来回跳。
+        """
+        now = time.monotonic()
+        hit = self._cache.get(key)
+        if hit is not None and ttl > 0 and now - hit[0] < ttl:
+            return hit[1]
+        try:
+            value = loader()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("fnOS %s 刷新失败，沿用上一轮数据", key, exc_info=True)
+            return hit[1] if hit else {}
+        # 只有「明显取不到」才算失败：None / 空 dict。空 list 可能是正常结果
+        # （没有已安装应用、没有登录设备），照常缓存。
+        empty = value is None or (isinstance(value, dict) and not value)
+        if empty:
+            if hit is not None:
+                _LOGGER.debug("fnOS %s 本轮没有数据，沿用上一轮", key)
+                return hit[1]
+            return {} if value is None else value
+        self._cache[key] = (now, value)
+        return value
+
+    def invalidate(self, *keys):
+        """作废数据块缓存（开关/按钮操作后调用，避免本轮读到旧值）。"""
+        if not keys:
+            self._cache.clear()
+            return
+        for key in keys:
+            self._cache.pop(key, None)
+
+    def _fetch_notify(self):
+        return self.payload("notify.unreadTotal").get("unreadTotal") or 0
+
+    def _fetch_login_devices(self):
         login = self.payload("user.listLoginDevice")
-        login_rows = login.get("loginDevice") if isinstance(
+        rows = login.get("loginDevice") if isinstance(
             login.get("loginDevice"), list) else []
-        snap["login_devices"] = login_rows
-        snap["docker"] = self._fetch_docker()
-        snap["download"] = self._fetch_download()
-        snap["file"] = self._fetch_file()
-        snap["external"] = self._fetch_external()
-        snap["vms"] = self._fetch_vms()
-        snap["apps"] = self._probe_apps()
-        snap["apps_installed"] = self.installed_apps()
-        return snap
+        return rows
+
+    #: 各数据块的刷新周期（秒）。0 = 每轮都取；慢变数据按 TTL 跳过。
+    BLOCK_TTL = {
+        "host": 0,            # 运行时长：每轮
+        "host_static": 600,   # 主机名/版本/机器码/风扇模式/电源计划：10 分钟
+        "resmon": 0,          # CPU/内存/网络/磁盘实时性能：每轮
+        "storage": 120,       # 容量 / 硬盘 / 健康
+        "net": 300,           # 网卡清单
+        "services": 120,      # SSH/SMB… 开关（操作后主动 invalidate）
+        "update": 1800,       # 系统更新状态
+        "notify": 120,        # 未读通知数
+        "login_devices": 300,  # 登录设备
+        "docker": 0,          # 容器清单 + 实时统计：每轮
+        "download": 30,       # 下载中心
+        "file": 300,          # 最近/收藏/回收站/分享计数
+        "external": 300,      # 证书 / 外部域名 / FN Connect
+        "vms": 0,             # 虚拟机清单与电源状态：每轮
+        "apps": 600,          # 相册/影视 App 探测（2 次 HTTP GET）
+        "apps_installed": 900,  # 已安装应用列表（REST）
+        "hardware": 3600,     # 硬件信息（静态）
+    }
+
+    def fetch_all(self):
+        """拉一轮全量快照；按块走 TTL 缓存，单接口失败沿用上一轮数据。"""
+
+        def block(key, loader):
+            return self._cached(key, self.BLOCK_TTL.get(key, 0), loader)
+
+        return {
+            "host": block("host", self._fetch_host),
+            "resmon": block("resmon", self._fetch_resmon),
+            "storage": block("storage", self._fetch_storage),
+            "net": block("net", self._fetch_net),
+            "services": block("services", self._fetch_services),
+            "update": block("update", self._fetch_update),
+            "notify_unread": block("notify", self._fetch_notify),
+            "login_devices": block("login_devices", self._fetch_login_devices),
+            "docker": block("docker", self._fetch_docker),
+            "download": block("download", self._fetch_download),
+            "file": block("file", self._fetch_file),
+            "external": block("external", self._fetch_external),
+            "vms": block("vms", self._fetch_vms),
+            "apps": block("apps", self._probe_apps),
+            "apps_installed": block("apps_installed", self.installed_apps),
+        }
 
     def _fetch_host(self):
+        # 主机名/版本/机器码/风扇模式/电源计划几乎不变 → 10 分钟取一次；
+        # 每轮只补运行时长（快变），硬件信息另有 1 小时缓存
+        static = self._cached(
+            "host_static", self.BLOCK_TTL["host_static"],
+            self._fetch_host_static)
+        uptime = self.call("appcgi.sysinfo.getUptime", default={}) or {}
+        hardware = self._cached(
+            "hardware", self.BLOCK_TTL["hardware"],
+            lambda: self.payload("appcgi.sysinfo.getHardwareInfo"))
+        snap = dict(static)
+        snap.setdefault("hostname", self.host)
+        snap["uptime_seconds"] = _last_num(uptime)
+        snap["hardware"] = hardware if isinstance(hardware, dict) else {}
+        return snap
+
+    def _fetch_host_static(self):
+        """慢变的主机静态信息（每 10 分钟一次）。"""
         host = self.call("appcgi.sysinfo.getHostName", default={}) or {}
         ver = self.call("appcgi.sysinfo.getTrimVersion", default={}) or {}
-        uptime = self.call("appcgi.sysinfo.getUptime", default={}) or {}
         machine = self.call("appcgi.sysinfo.getMachineId", default={}) or {}
         fan = self.call("appcgi.sysinfo.getFanMode", default={}) or {}
         plans = self.call("appcgi.sysinfo.listPowerPlan", default=[]) or []
-        # 硬件信息（免登录接口）：CPU/内存条/GPU/BIOS/主板/系统盘/虚拟化能力。
-        # 返回结构官方未公开，这边原样保留，sensor.py 做防御式解析。
-        hardware = self.payload("appcgi.sysinfo.getHardwareInfo")
         return {
             "hostname": _first_key(host, "hostname", "hostName", "name",
                                   default=self.host),
@@ -520,10 +612,8 @@ class FnOsClient:
             "edition": _first_key(ver, "edition"),
             "platform": _first_key(ver, "platform"),
             "machine_id": _first_key(machine, "machineId", "machine_id", "id"),
-            "uptime_seconds": _last_num(uptime),
             "fan_mode": _first_key(fan, "mode", "fanMode", "level", "value"),
             "power_plans": plans if isinstance(plans, list) else [],
-            "hardware": hardware if isinstance(hardware, dict) else {},
         }
 
     def _fetch_resmon(self):
@@ -551,10 +641,19 @@ class FnOsClient:
         loadavg = cpu.get("loadavg") if isinstance(cpu.get("loadavg"),
                                                    dict) else {}
 
-        gpu_p = self.payload("appcgi.resmon.gpu")
-        gpus = gpu_p.get("gpu") if isinstance(gpu_p.get("gpu"), list) else []
-        gpu0 = gpus[0] if gpus and isinstance(gpus[0], dict) else {}
-        gpu_ram = gpu0.get("ram") if isinstance(gpu0.get("ram"), dict) else {}
+        now = time.monotonic()
+        gpu0 = {}
+        gpu_ram = {}
+        # 有独显才每轮取；检测为“无独显”后 10 分钟内跳过该请求
+        if self._gpu_present is not False or now - self._gpu_probe_at > 600:
+            gpu_p = self.payload("appcgi.resmon.gpu")
+            gpus = (gpu_p.get("gpu")
+                    if isinstance(gpu_p.get("gpu"), list) else [])
+            self._gpu_present = bool(gpus)
+            self._gpu_probe_at = now
+            gpu0 = gpus[0] if gpus and isinstance(gpus[0], dict) else {}
+            gpu_ram = gpu0.get("ram") if isinstance(gpu0.get("ram"),
+                                                    dict) else {}
 
         net_p = self.payload("appcgi.resmon.net")
         ifs = net_p.get("ifs") if isinstance(net_p.get("ifs"), list) else []
@@ -575,8 +674,13 @@ class FnOsClient:
             disk_write = round(sum(float(d.get("write") or 0)
                                    for d in dsk_rows if isinstance(d, dict)), 1)
 
-        fan_p = self.payload("appcgi.resmon.sysFan")
-        fan_rpm = _last_num(fan_p) if fan_p.get("isTrim") else None
+        fan_rpm = None
+        # 非 trim 硬件没有风扇转速：探测一次后 10 分钟内不再请求
+        if self._has_fan is not False or now - self._fan_probe_at > 600:
+            fan_p = self.payload("appcgi.resmon.sysFan")
+            self._has_fan = bool(fan_p.get("isTrim"))
+            self._fan_probe_at = now
+            fan_rpm = _last_num(fan_p) if self._has_fan else None
 
         return {
             "cpu_pct": _first_key(busy, "all", "total", "busy"),
@@ -743,17 +847,23 @@ class FnOsClient:
             "raw": row,
         }
 
+    def _download_missing(self):
+        return {"installed": False, "active_tasks": None,
+                "speed_down": None, "speed_up": None}
+
     def _fetch_download(self):
         # 实测（2026-10-18）：
         #   task.query → data.block.data 为 JSON 字符串：
         #     {"stats":{"all":..,"downloading":..,"active":..,...},
         #      "stats_speed_size":{"dl_speed":..,"up_speed":..,...}}
-        #   stat.all → data.rsp.{dl_speed,up_speed,...}
-        stat = self.payload("appcgi.downloadcenter.stat.all")
-        rsp = stat.get("rsp") if isinstance(stat.get("rsp"), dict) else {}
+        #   stat.all → data.rsp.{dl_speed,up_speed,...}（旧版/兜底）
+        # 未安装时缓存 10 分钟负结果，避免每轮白打两次接口
+        now = time.monotonic()
+        if now < self._download_missing_until:
+            return self._download_missing()
+
         active = None
-        speed_down = _first_key(rsp, "dl_speed", "downloadSpeed")
-        speed_up = _first_key(rsp, "up_speed", "uploadSpeed")
+        speed_down = speed_up = None
         tasks = self.payload("appcgi.downloadcenter.task.query",
                              start=0, limit=5)
         block = tasks.get("block") if isinstance(tasks.get("block"),
@@ -769,14 +879,25 @@ class FnOsClient:
         if stats:
             active = _first_key(stats, "active", "downloading",
                                 default=stats.get("all"))
-        if speed_down is None:
+        if speeds:
             speed_down = speeds.get("dl_speed")
-        if speed_up is None:
             speed_up = speeds.get("up_speed")
-        installed = bool(stats or rsp or block)
+
+        rsp = {}
+        if not stats and not speeds:
+            # task.query 没给出统计 → 退回 stat.all（少一轮请求的常规路径）
+            stat = self.payload("appcgi.downloadcenter.stat.all")
+            rsp = stat.get("rsp") if isinstance(stat.get("rsp"),
+                                                dict) else {}
+            speed_down = speed_down if speed_down is not None else _first_key(
+                rsp, "dl_speed", "downloadSpeed")
+            speed_up = speed_up if speed_up is not None else _first_key(
+                rsp, "up_speed", "uploadSpeed")
+
+        installed = bool(stats or speeds or rsp or block)
         if not installed:
-            return {"installed": False, "active_tasks": None,
-                    "speed_down": None, "speed_up": None}
+            self._download_missing_until = now + 600
+            return self._download_missing()
         return {
             "installed": True,
             "active_tasks": active,

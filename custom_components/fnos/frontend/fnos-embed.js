@@ -280,6 +280,8 @@
   const ORIGIN_HEADERS = { "Cache-Control": "no-store" };
   let lastOriginReport = 0;
   let originRetries = 0;
+  // 已经成功上报过的地址栏 origin：没变化就完全不再发请求
+  let reportedOrigin = "";
 
   function authFetcher() {
     try {
@@ -301,6 +303,8 @@
   }
 
   function reportOrigin() {
+    const origin = String(location.origin || "");
+    if (origin && origin === reportedOrigin) { return; }
     const now = Date.now();
     if (now - lastOriginReport < 30000) { return; }
     const fetcher = authFetcher();
@@ -314,11 +318,13 @@
     originRetries = 0;
     lastOriginReport = now;
     try {
-      fetcher(ORIGIN_PATH, {
+      Promise.resolve(fetcher(ORIGIN_PATH, {
         method: "GET",
         credentials: "same-origin",
         cache: "no-store",
         headers: ORIGIN_HEADERS
+      })).then((resp) => {
+        if (!resp || resp.ok) { reportedOrigin = origin; }
       }).catch(() => {});
     } catch (_) { /* 页面正在卸载等场景，静默 */ }
   }
@@ -329,5 +335,5 @@
   });
   window.addEventListener("pageshow", reportOrigin);
 
-  window.__fnosFloatEmbed = "1.0.0";
+  window.__fnosFloatEmbed = "1.1.2";
 })();

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
@@ -78,6 +79,41 @@ class FnOsCoordinator(DataUpdateCoordinator):
             raise UpdateFailed(f"fnOS 数据拉取失败：{err}") from err
 
 
+#: 设备集合没变时的兜底重扫间隔（秒）：不必每 30 秒全表 upsert + 修剪
+_DEVICE_RESCAN_SECONDS = 600.0
+
+
+def _device_signature(snap):
+    """设备集合签名：主机名/版本 + 容器名 + 虚拟机名。"""
+    host = snap.get("host") or {}
+    containers = sorted(
+        str(row.get("name")) for row in
+        (snap.get("docker") or {}).get("containers") or []
+        if isinstance(row, dict) and row.get("name"))
+    vms = sorted(
+        str(vm.get("name")) for vm in
+        (snap.get("vms") or {}).get("list") or []
+        if isinstance(vm, dict) and vm.get("name"))
+    return (host.get("hostname"), host.get("version"),
+            tuple(containers), tuple(vms))
+
+
+def sync_devices_if_needed(hass, entry, snap):
+    """设备集合没变就跳过 upsert/修剪，只在变化或每 10 分钟兜底时执行。"""
+    info = (hass.data.get(DOMAIN) or {}).get(entry.entry_id)
+    if info is None:
+        snapshot_devices(hass, entry, snap)
+        return
+    signature = _device_signature(snap)
+    now = time.monotonic()
+    if (info.get("_dev_sig") == signature
+            and now - info.get("_dev_sig_at", 0.0) < _DEVICE_RESCAN_SECONDS):
+        return
+    info["_dev_sig"] = signature
+    info["_dev_sig_at"] = now
+    snapshot_devices(hass, entry, snap)
+
+
 def snapshot_devices(hass, entry, snap):
     """按快照增补设备注册表（幂等 upsert；容器/虚拟机增删自动跟随）。"""
     dev_reg = dr.async_get(hass)
@@ -142,6 +178,113 @@ def _prune_devices(hass, entry, live_dynamic):
             dev_reg.async_remove_device(device.id)
 
 
+def live_dynamic_keys(snap):
+    """快照里当前存在的动态设备：``{(kind, key)}``（容器 / 虚拟机）。"""
+    snap = snap or {}
+    keys: set = set()
+    for row in (snap.get("docker") or {}).get("containers") or []:
+        name = row.get("name")
+        if name:
+            keys.add((KIND_DOCKER, str(name)))
+    for vm in (snap.get("vms") or {}).get("list") or []:
+        name = str(vm.get("name") or "")
+        if name:
+            keys.add((KIND_VM, name))
+    return keys
+
+
+def remove_entities_by_unique_id(hass, domain, unique_ids):
+    """按 unique_id 删除实体（注册表条目删除后实体自己会退出状态机）。
+
+    不用 ``async_get_entity_id``：它拿不到已禁用（disabled）的条目，而残留实体
+    往往正是被禁用过的那些；直接遍历注册表能把它们一并清掉。
+    """
+    registry = er.async_get(hass)
+    wanted = set(unique_ids)
+    if not wanted:
+        return 0
+    removed = 0
+    for ent in list(registry.entities.values()):
+        if (getattr(ent, "platform", "") == DOMAIN
+                and ent.unique_id in wanted
+                and ent.entity_id.startswith(f"{domain}.")):
+            registry.async_remove(ent.entity_id)
+            removed += 1
+            _LOGGER.debug("fnOS 清理实体：%s（%s）",
+                          ent.entity_id, ent.unique_id)
+    return removed
+
+
+def forget_dynamic_device(hass, entry, kind, key):
+    """删掉已消失的容器/虚拟机设备（仍有实体挂着时留给下轮修剪）。"""
+    identifier = device_identifier(entry, kind, key)
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+    for device in dr.async_entries_for_config_entry(dev_reg, entry.entry_id):
+        if (DOMAIN, identifier) not in device.identifiers:
+            continue
+        if er.async_entries_for_device(ent_reg, device.id):
+            return False
+        name = device.name_by_user or device.name or identifier
+        dev_reg.async_remove_device(device.id)
+        _LOGGER.info("fnOS 设备已删除：%s（%s）", name, key)
+        return True
+    return False
+
+
+def purge_dynamic_entities(hass, entry, domain, keys, owned, known):
+    """清理属于已消失设备（``keys`` 里的 ``(kind, key)``）的实体。
+
+    ``owned`` 为 ``unique_id → (kind, key)`` 映射（就地更新），``known`` 同步
+    剔除；实体删完后顺手把设备也删掉。返回删除的实体数量。
+    """
+    total = 0
+    for kind, key in keys:
+        uids = [uid for uid, owner in owned.items() if owner == (kind, key)]
+        if not uids:
+            continue
+        for uid in uids:
+            owned.pop(uid, None)
+            known.discard(uid)
+        total += remove_entities_by_unique_id(hass, domain, uids)
+        forget_dynamic_device(hass, entry, kind, key)
+    return total
+
+
+def _purge_stale_dynamic_entities(hass, entry, snap):
+    """启动时清理「设备已被删除、实体还留在注册表」的残留。
+
+    运行期由各平台跟随协调器刷新清理；但如果在 HA 停机期间删掉了容器/虚拟机，
+    这里必须补一次——否则设备一直挂着、回归不了。
+    """
+    dev_reg = dr.async_get(hass)
+    ent_reg = er.async_get(hass)
+    live = {device_identifier(entry, kind, key)
+            for kind, key in live_dynamic_keys(snap)}
+    removed = 0
+    for ent in list(er.async_entries_for_config_entry(ent_reg, entry.entry_id)):
+        if not ent.device_id:
+            continue
+        device = dev_reg.async_get(ent.device_id)
+        if device is None:
+            continue
+        identifier = next(
+            (ident[1] for ident in device.identifiers if ident[0] == DOMAIN),
+            None)
+        if not identifier:
+            continue
+        parts = identifier.split(":", 2)
+        if len(parts) < 2 or parts[1] not in (KIND_DOCKER, KIND_VM):
+            continue
+        if identifier in live:
+            continue
+        ent_reg.async_remove(ent.entity_id)
+        removed += 1
+    if removed:
+        _LOGGER.info("fnOS 清理已删除设备的残留实体：%s 个", removed)
+    return removed
+
+
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """加载配置条目。"""
     hass.data.setdefault(DOMAIN, {})
@@ -170,11 +313,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     await origin_mod.async_setup_origin(hass)
     await origin_mod.async_load_learned_bases(hass)
 
-    # 按首轮快照补齐设备，之后每轮刷新跟随容器/虚拟机增删
-    snapshot_devices(hass, entry, coordinator.data)
+    # 停机期间删除的容器/虚拟机：先清残留实体，再按首轮快照补齐设备
+    _purge_stale_dynamic_entities(hass, entry, coordinator.data)
+    sync_devices_if_needed(hass, entry, coordinator.data)
 
     def _on_refreshed():
-        snapshot_devices(hass, entry, coordinator.data)
+        sync_devices_if_needed(hass, entry, coordinator.data)
 
     entry.async_on_unload(coordinator.async_add_listener(_on_refreshed))
 
@@ -187,7 +331,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     """卸载配置条目。"""
-    unload_ok = await hass.config_entries.async_forward_entry_unload(
+    unload_ok = await hass.config_entries.async_unload_platforms(
         entry, PLATFORMS)
     if unload_ok:
         info = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
